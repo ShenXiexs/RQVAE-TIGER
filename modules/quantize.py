@@ -1,3 +1,5 @@
+# quantize.py
+
 import gin
 import torch
 
@@ -72,7 +74,6 @@ class Quantize(nn.Module):
             L2NormalizationLayer(dim=-1) if codebook_normalize else nn.Identity()
         )
 
-        self.commitment_weight = commitment_weight
         self.quantize_loss = QuantizeLoss(commitment_weight)
         self._init_weights()
 
@@ -89,9 +90,9 @@ class Quantize(nn.Module):
             if isinstance(m, nn.Embedding):
                 nn.init.uniform_(m.weight)
     
-    @torch.no_grad()
+    @torch.no_grad
     def _kmeans_init(self, x) -> None:
-        print(f"K-means初始化: {x.shape[0]}个样本, {self.n_embed}个中心")
+        print(f"K-means初始化: {x.shape[0]}个样本, {self.n_embed}个中心")  # 添加这行
         kmeans_init_(self.embedding.weight, x=x)
         self.kmeans_initted = True
 
@@ -104,52 +105,35 @@ class Quantize(nn.Module):
         if self.do_kmeans_init and not self.kmeans_initted:
             self._kmeans_init(x=x)
 
-        # === codebook ===
+        
         codebook = self.out_proj(self.embedding.weight)
-
-        # === 距离计算 ===
+        
         if self.distance_mode == QuantizeDistance.L2:
             dist = (
-                (x ** 2).sum(dim=1, keepdim=True) +
-                (codebook ** 2).sum(dim=1).unsqueeze(0) -
+                (x**2).sum(axis=1, keepdim=True) +
+                (codebook.T**2).sum(axis=0, keepdim=True) -
                 2 * x @ codebook.T
             )
         elif self.distance_mode == QuantizeDistance.COSINE:
             dist = -(
                 x / x.norm(dim=1, keepdim=True) @
-                (codebook.T) / codebook.norm(dim=1, keepdim=True).unsqueeze(0)
+                (codebook.T) / codebook.T.norm(dim=0, keepdim=True)
             )
         else:
             raise Exception("Unsupported Quantize distance mode.")
 
-        # 最近邻索引
-        _, ids = (dist.detach()).min(dim=1)
+        _, ids = (dist.detach()).min(axis=1)
 
         if self.training:
             if self.forward_mode == QuantizeForwardMode.GUMBEL_SOFTMAX:
-                # --- Gumbel logits 归一化 ---
-                logits = -dist
-                logits = logits - logits.min(dim=1, keepdim=True)[0]  # 防止数值爆炸
                 weights = gumbel_softmax_sample(
-                    logits, temperature=temperature, device=self.device
+                    -dist, temperature=temperature, device=self.device
                 )
                 emb = weights @ codebook
                 emb_out = emb
-
             elif self.forward_mode == QuantizeForwardMode.STE:
                 emb = self.get_item_embeddings(ids)
-                # 标准 Straight-Through
                 emb_out = x + (emb - x).detach()
-                # 双向损失
-                commitment = self.commitment_weight * F.mse_loss(x, emb.detach())
-                codebook_loss = F.mse_loss(x.detach(), emb)
-                loss = commitment + codebook_loss
-                return QuantizeOutput(
-                    embeddings=emb_out,
-                    ids=ids,
-                    loss=loss
-                )
-
             elif self.forward_mode == QuantizeForwardMode.ROTATION_TRICK:
                 emb = self.get_item_embeddings(ids)
                 emb_out = efficient_rotation_trick_transform(
@@ -160,11 +144,9 @@ class Quantize(nn.Module):
                 emb_out = emb_out * (
                     torch.norm(emb, dim=1, keepdim=True) / (torch.norm(x, dim=1, keepdim=True) + 1e-6)
                 ).detach()
-
             else:
                 raise Exception("Unsupported Quantize forward mode.")
             
-            # 默认损失（非 STE 的分支）
             loss = self.quantize_loss(query=x, value=emb)
         
         else:
