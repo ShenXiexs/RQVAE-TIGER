@@ -1,4 +1,5 @@
 # rqvae.py
+
 import math
 from typing import List, NamedTuple, Any
 
@@ -53,12 +54,9 @@ class RqVae(nn.Module, PyTorchModelHubMixin):
         commitment_weight: float = 0.25,
         n_cat_features: int = 0,
         # === 统计与日志 ===
-        util_log_every: int = 50,
-        util_decay: float = 0.99,
-        util_recent_n: int = 5,
-        # === 外层损失权重（新增，可选）===
-        recon_weight: float = 1.0,
-        vq_weight: float = 1.0,
+        util_log_every: int = 50,   # 每多少步打印一次；<=0 则不打印
+        util_decay: float = 0.99,    # EMA 衰减
+        util_recent_n: int = 5       # 仅保留最近 N 行
     ) -> None:
         super().__init__()
         self._config = locals()
@@ -87,15 +85,6 @@ class RqVae(nn.Module, PyTorchModelHubMixin):
                 for i in range(n_layers)
             ]
         )
-        # 暴露一个统一的属性名，便于训练脚本判断是否做了 codebook 归一化
-        for i, layer in enumerate(self.layers):
-            try:
-                setattr(layer, "codebook_normalize", bool(i == 0 and codebook_normalize))
-            except Exception:
-                pass
-        
-        # 让各层分到的残差强度可学习（初值<1 有助于避免 L0 独占）
-        self.res_scales = nn.Parameter(torch.ones(self.n_layers) * 0.7)
 
         # 编码器 / 解码器
         self.encoder = MLP(
@@ -124,9 +113,6 @@ class RqVae(nn.Module, PyTorchModelHubMixin):
         self.util_recent_n = int(util_recent_n)
         self._step = 0
         self.util_recent_logs: List[str] = []
-        # === 外层损失权重（新增）===
-        self.recon_weight = float(recon_weight)
-        self.vq_weight = float(vq_weight)
 
         # === 用于 EMA 的统计缓冲区 ===
         # counts: [n_layers, codebook_size]；tokens: [n_layers]
@@ -160,13 +146,6 @@ class RqVae(nn.Module, PyTorchModelHubMixin):
 
     def decode(self, x: Tensor) -> Tensor:
         return self.decoder(x)
-    
-    # ---------- set_loss_weights ----------
-    def set_loss_weights(self, recon_w: float | None = None, vq_w: float | None = None):
-        if recon_w is not None:
-            self.recon_weight = float(recon_w)
-        if vq_w is not None:
-            self.vq_weight = float(vq_w)
 
     # ---------- 前向分解 ----------
     def get_semantic_ids(self, x: Tensor, gumbel_t: float = 0.001) -> RqVaeOutput:
@@ -180,8 +159,7 @@ class RqVae(nn.Module, PyTorchModelHubMixin):
             q = layer(res, temperature=gumbel_t)  # q.ids: [batch]
             quantize_loss = quantize_loss + q.loss
             emb, idx = q.embeddings, q.ids
-            scale = self.res_scales[len(embs)]
-            res = res - scale * emb
+            res = res - emb
             sem_ids.append(idx)
             embs.append(emb)
 
@@ -191,8 +169,7 @@ class RqVae(nn.Module, PyTorchModelHubMixin):
             sem_ids=rearrange(torch.stack(sem_ids, dim=0), "h b -> h b"),
             quantize_loss=torch.as_tensor(quantize_loss),
         )
- 
-    
+
     # ---------- forward ----------
     def forward(self, batch: Any, gumbel_t: float) -> RqVaeComputedLosses:
         x = batch if isinstance(batch, torch.Tensor) else batch.x
@@ -210,17 +187,9 @@ class RqVae(nn.Module, PyTorchModelHubMixin):
         else:
             x_hat = l2norm(x_hat)
 
-        # —— 子损失：可能按样本返回，这里统一成标量 —— 
-        reconstruction_loss = self.reconstruction_loss(x_hat, x)          # [B] 或 标量
-        rqvae_loss = qout.quantize_loss                                   # [B] 或 标量
-
-        if reconstruction_loss.dim() > 0:
-            reconstruction_loss = reconstruction_loss.mean()
-        if torch.is_tensor(rqvae_loss) and rqvae_loss.dim() > 0:
-            rqvae_loss = rqvae_loss.mean()
-
-        # —— 总损失（外层可加权，训练反传就用它）——
-        loss = self.recon_weight * reconstruction_loss + self.vq_weight * rqvae_loss
+        reconstruction_loss = self.reconstruction_loss(x_hat, x)
+        rqvae_loss = qout.quantize_loss
+        loss = (reconstruction_loss + rqvae_loss).mean()
 
         # 一些可视化指标
         with torch.no_grad():
@@ -255,10 +224,11 @@ class RqVae(nn.Module, PyTorchModelHubMixin):
 
         return RqVaeComputedLosses(
             loss=loss,
-            reconstruction_loss=reconstruction_loss,   # 标量
-            rqvae_loss=rqvae_loss,                     # 标量
+            reconstruction_loss=reconstruction_loss.mean(),
+            rqvae_loss=rqvae_loss.mean() if torch.is_tensor(rqvae_loss) else torch.as_tensor(rqvae_loss),
             embs_norm=embs_norm,
             p_unique_ids=p_unique_ids,
+            # 新增指标
             cosine_sim=cosine_sim,
             rmse=rmse,
             quantization_error=quantization_error,
