@@ -37,6 +37,6 @@ class QuantizeLoss(nn.Module):
         self.commitment_weight = commitment_weight
 
     def forward(self, query: Tensor, value: Tensor) -> Tensor:
-        emb_loss = ((query.detach() - value)**2).sum(axis=[-1])
-        query_loss = ((query - value.detach())**2).sum(axis=[-1])
+        emb_loss = ((query.detach() - value)**2).mean(axis=-1)
+        query_loss = ((query - value.detach())**2).mean(axis=-1)
         return emb_loss + self.commitment_weight * query_loss
