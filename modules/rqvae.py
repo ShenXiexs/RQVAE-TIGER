@@ -53,6 +53,9 @@ class RqVae(nn.Module, PyTorchModelHubMixin):
         n_layers: int = 3,
         commitment_weight: float = 0.25,
         n_cat_features: int = 0,
+        vq_layer_decay: float = 1.0,   # 每层乘以 gamma^(layer_index)
+        rec_weight: float = 1.0,       # 总损失里 R 的权重
+        vq_weight: float = 1.0,        # 总损失里 VQ 的权重
         # === 统计与日志 ===
         util_log_every: int = 50,   # 每多少步打印一次；<=0 则不打印
         util_decay: float = 0.99,    # EMA 衰减
@@ -62,6 +65,9 @@ class RqVae(nn.Module, PyTorchModelHubMixin):
         self._config = locals()
 
         # 基本参数
+        self.vq_layer_decay = float(vq_layer_decay)
+        self.rec_weight = float(rec_weight)
+        self.vq_weight = float(vq_weight)
         self.input_dim = input_dim
         self.embed_dim = embed_dim
         self.hidden_dims = hidden_dims
@@ -78,7 +84,7 @@ class RqVae(nn.Module, PyTorchModelHubMixin):
                     n_embed=codebook_size,
                     forward_mode=codebook_mode,
                     do_kmeans_init=codebook_kmeans_init,
-                    codebook_normalize=(i == 0 and codebook_normalize),
+                    codebook_normalize=codebook_normalize,
                     sim_vq=codebook_sim_vq,
                     commitment_weight=commitment_weight,
                 )
@@ -150,16 +156,19 @@ class RqVae(nn.Module, PyTorchModelHubMixin):
     # ---------- 前向分解 ----------
     def get_semantic_ids(self, x: Tensor, gumbel_t: float = 0.001) -> RqVaeOutput:
         res = self.encode(x)
-
+        res = F.normalize(res, dim=-1)  # 编码向量单位化
         quantize_loss = 0.0
         embs, residuals, sem_ids = [], [], []
 
-        for layer in self.layers:
+        for i, layer in enumerate(self.layers):
             residuals.append(res)
             q = layer(res, temperature=gumbel_t)  # q.ids: [batch]
-            quantize_loss = quantize_loss + q.loss
+            # 层衰减：alpha_i = gamma^i
+            alpha = (self.vq_layer_decay ** i)
+            quantize_loss = quantize_loss + alpha * q.loss
             emb, idx = q.embeddings, q.ids
             res = res - emb
+            res = F.normalize(res, dim=-1)  # 残差也单位化，后层更稳
             sem_ids.append(idx)
             embs.append(emb)
 
